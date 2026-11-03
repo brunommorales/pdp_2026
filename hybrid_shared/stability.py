@@ -92,6 +92,7 @@ def apply_finetune_lr_transition(
         param_group["lr"] = target_lr
 
     if scheduler is not None:
+        scheduler.base_lrs = [target_lr] * len(scheduler.base_lrs)
         scheduler.base_lr = target_lr
         scheduler.current_epoch = max(scheduler.current_epoch, scheduler.warmup_epochs)
 

@@ -32,7 +32,7 @@ from retfound_green.utils import (
     validate_retfound_green_args,
 )
 
-from hybrid_shared.data_loader_bridge_opt import get_data_loaders
+from hybrid_shared.data_loader_bridge_opt import get_data_loaders, set_loader_epoch
 from hybrid_shared.metrics import compute_metrics, find_optimal_threshold
 from hybrid_shared.profiling import PerformanceProfiler, format_profiling_report
 from hybrid_shared.results import (
@@ -471,6 +471,7 @@ def main() -> None:
         world_size=world_size,
         enable_amp=args.enable_amp,
         model_name=RETFOUND_GREEN_NORMALIZATION_MODEL,
+        seed=args.seed,
     )
 
     effective_pos_weight = float(args.pos_weight)
@@ -543,6 +544,7 @@ def main() -> None:
     overall_start_time = time.perf_counter()
 
     for epoch in range(args.epochs):
+        set_loader_epoch(train_loader, epoch)
         if args.freeze_epochs > 0 and epoch == args.freeze_epochs:
             base_model = model.module if hasattr(model, "module") else model
             base_model.set_backbone_trainable(True)

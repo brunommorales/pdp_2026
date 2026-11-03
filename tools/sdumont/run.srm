@@ -32,6 +32,10 @@
 #                contencao de CPU e de PCIe. Use PACK para os runs que existem
 #                so para a variancia de AUC, e deixe os runs de referencia de
 #                desempenho sozinhos no no (PACK vazio).
+#   HCPA_LR_SCALE  none (padrao) | sqrt | linear. Regra de escala do LR com o
+#                batch global (ver <abordagem>/hcpa_lr_scale.py). Diferente de
+#                none, a celula ganha o sufixo _lr<modo> no diretorio, para nao
+#                gravar por cima dos runs da bateria principal.
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
@@ -43,6 +47,13 @@ RUN_END="${RUN_END:-9}"
 EPOCHS="${EPOCHS:-200}"
 BASE_SEED="${BASE_SEED:-42}"
 BATCH_SIZE="${BATCH_SIZE:-}"
+# Validado aqui, e nao so dentro do container: um valor invalido derrubaria o
+# job so depois da espera na fila e do staging.
+HCPA_LR_SCALE="${HCPA_LR_SCALE:-none}"
+case "${HCPA_LR_SCALE}" in
+  none|sqrt|linear) ;;
+  *) echo "[FAIL] HCPA_LR_SCALE=${HCPA_LR_SCALE} invalido (use none|sqrt|linear)"; exit 97 ;;
+esac
 ARCH="$(uname -m)"
 SIF_DIR="${PROJECT_DIR}/containers/${ARCH}"
 CONT_WORKDIR=/workspace
@@ -84,11 +95,12 @@ GPUS_PER_NODE=$(( NGPUS / NNODES ))
 
 GPU_MODEL="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
 TAG="${GPU_MODEL:-gpu}_${NGPUS}gpu_${DATASET}"
+[[ "${HCPA_LR_SCALE}" != "none" ]] && TAG+="_lr${HCPA_LR_SCALE}"
 RESULTS_SUBDIR="results_sdumont/${TAG}"
 
 echo "=== HCPA/SDumont ============================================="
 echo " job=${SLURM_JOB_ID:-local}  arch=${ARCH}  gpu=${GPU_MODEL}"
-echo " approach=${APPROACH}  dataset=${DATASET}  epochs=${EPOCHS}"
+echo " approach=${APPROACH}  dataset=${DATASET}  epochs=${EPOCHS}  lr_scale=${HCPA_LR_SCALE}"
 echo " nodes=${NNODES} x ${GPUS_PER_NODE} gpu = ${NGPUS} gpus  runs=${RUN_START}..${RUN_END}"
 echo " sif=${SIF}"
 echo "=============================================================="
@@ -274,6 +286,7 @@ exec "${PIN[@]}" singularity exec --nv --cleanenv \
   --env TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-}" \
   --env HCPA_ENERGY_ALL_VISIBLE_GPUS="${HCPA_ENERGY_ALL_VISIBLE_GPUS:-1}" \
   --env HCPA_CACHE_IN_MEMORY="${HCPA_CACHE_IN_MEMORY:-1}" \
+  --env HCPA_LR_SCALE="${HCPA_LR_SCALE}" --env HCPA_WORLD_SIZE="${NGPUS}" \
   --env OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}" \
   --env NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
   --env MASTER_ADDR="${MASTER_ADDR}" --env MASTER_PORT="${MASTER_PORT}" \
@@ -300,7 +313,7 @@ for RUN_ID in $(seq "${RUN_START}" "${RUN_END}"); do
 
   export ARGS_STR ENTRY SIF NNODES GPUS_PER_NODE MASTER_ADDR MASTER_PORT \
          FRAMEWORK STAGED_DIR DATA_REL CONT_WORKDIR APPROACH PROJECT_DIR \
-         RUN_ID LOCAL_ROOT SITE_DIR LDEXTRA_DIR
+         RUN_ID LOCAL_ROOT SITE_DIR LDEXTRA_DIR NGPUS HCPA_LR_SCALE
 
   if [[ -n "${PACK}" ]]; then
     export PACK_SLOT=$(( (RUN_ID - RUN_START) % PACK ))

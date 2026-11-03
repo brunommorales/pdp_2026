@@ -191,6 +191,8 @@ def parse_args():
 
     from hcpa_lr_scale import escalar_lr
     args.lrate = escalar_lr(args.lrate)
+    if args.fine_tune_lr > 0:
+        args.fine_tune_lr = escalar_lr(args.fine_tune_lr, "fine_tune_lr")
     return args
 
 
@@ -716,7 +718,7 @@ def main():
             f"crop_ratio={float(getattr(args, 'fundus_crop_ratio', 1.0)):.2f}"
         )
 
-    train_sampler = DistributedSampler(train_ds, shuffle=True) if world_size > 1 else None
+    train_sampler = DistributedSampler(train_ds, shuffle=True, seed=seed_base) if world_size > 1 else None
     valid_sampler = DistributedSampler(valid_ds, shuffle=False) if world_size > 1 else None
     test_sampler = DistributedSampler(test_ds, shuffle=False) if world_size > 1 else None
 

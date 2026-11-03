@@ -44,7 +44,7 @@ from hybrid_shared.training_utils_opt import (
     ddp_concat_variable_length,
     ensure_cuda_ready,
 )
-from hybrid_shared.data_loader_bridge_opt import get_data_loaders, get_backbone, unpack_batch
+from hybrid_shared.data_loader_bridge_opt import get_data_loaders, get_backbone, set_loader_epoch, unpack_batch
 from hybrid_simple.utils import modify_backbone_for_feature_extraction
 
 
@@ -205,7 +205,6 @@ def apply_finetune_lr_transition(
         param_group["lr"] = target_lr
 
     if scheduler is not None:
-        scheduler.base_lr = target_lr
         scheduler.current_epoch = max(scheduler.current_epoch, scheduler.warmup_epochs)
 
     return target_lr
@@ -744,6 +743,7 @@ def main():
         world_size=world_size,
         enable_amp=args.enable_amp,
         model_name=args.backbone,
+        seed=args.seed,
     )
 
     if rank == 0:
@@ -834,6 +834,7 @@ def main():
     best_state_dict = None
 
     for epoch in range(args.epochs):
+        set_loader_epoch(train_loader, epoch)
         if scheduler is not None:
             scheduler.step()
 
@@ -865,13 +866,14 @@ def main():
             )
             if rank == 0:
                 scheduler_note = (
-                    "cosine scheduler realinhado para não ramp-up de volta ao LR pré-unfreeze."
+                    f"so nesta epoca; a partir da proxima o cosseno retoma sobre "
+                    f"{scheduler.base_lrs[0]:.2e} (ver apply_finetune_lr_transition)."
                     if scheduler is not None
                     else "scheduler desativado."
                 )
                 print(
                     f"[INFO] Backbone unfrozen at epoch {epoch + 1}; finetune LR ajustado para "
-                    f"{current_lr:.2e} (fine_tune_lr_factor={args.fine_tune_lr_factor}). "
+                    f"{current_lr:.2e} (fine_tune_lr_factor={args.fine_tune_lr_factor}) "
                     f"{scheduler_note}"
                 )
 

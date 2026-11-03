@@ -108,6 +108,7 @@ def get_data_loaders(
     world_size: int = 1,
     enable_amp: bool = True,
     model_name: str = "inception_v3",
+    seed: int = 42,
 ):
     try:
         pytorch_opt_module = _load_pytorch_opt_module()
@@ -134,7 +135,7 @@ def get_data_loaders(
             )
 
         device_id = rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
-        shuffle_seed = 42
+        shuffle_seed = seed
 
         if use_dali:
             train_loader = pytorch_opt_module.build_dali_loader(
@@ -189,6 +190,7 @@ def get_data_loaders(
                 model_name=model_name,
                 use_cuda=torch.cuda.is_available(),
                 shuffle=True,
+                seed=shuffle_seed,
             )
             val_loader, _, _, _ = pytorch_opt_module.build_torch_loader(
                 tfrec_files=val_files,
@@ -221,6 +223,12 @@ def get_data_loaders(
 
     except Exception as e:
         raise RuntimeError(f"Não foi possível carregar dataloaders do pytorch_opt: {e}") from e
+
+
+def set_loader_epoch(loader, epoch: int) -> None:
+    sampler = getattr(loader, "sampler", None)
+    if isinstance(sampler, torch.utils.data.DistributedSampler):
+        sampler.set_epoch(epoch)
 
 
 def get_backbone(

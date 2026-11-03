@@ -296,6 +296,8 @@ def parse_args():
 
     from hcpa_lr_scale import escalar_lr
     args.lrate = escalar_lr(args.lrate)
+    if args.fine_tune_lr > 0:
+        args.fine_tune_lr = escalar_lr(args.fine_tune_lr, "fine_tune_lr")
     return args
 
 

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from hybrid_shared.data_loader_bridge import get_backbone, get_data_loaders as get_data_loaders_base, unpack_batch
+from hybrid_shared.data_loader_bridge import (
+    get_backbone,
+    get_data_loaders as get_data_loaders_base,
+    set_loader_epoch,
+    unpack_batch,
+)
 
 
 def get_data_loaders(
@@ -15,6 +20,7 @@ def get_data_loaders(
     world_size: int = 1,
     enable_amp: bool = True,
     model_name: str = "inception_v3",
+    seed: int = 42,
 ):
     return get_data_loaders_base(
         tfrec_dir=tfrec_dir,
@@ -28,7 +34,8 @@ def get_data_loaders(
         world_size=world_size,
         enable_amp=enable_amp,
         model_name=model_name,
+        seed=seed,
     )
 
 
-__all__ = ["get_backbone", "get_data_loaders", "unpack_batch"]
+__all__ = ["get_backbone", "get_data_loaders", "set_loader_epoch", "unpack_batch"]

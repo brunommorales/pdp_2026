@@ -258,6 +258,8 @@ def parse_args():
 
     from hcpa_lr_scale import escalar_lr
     args.lrate = escalar_lr(args.lrate)
+    if args.fine_tune_lr > 0:
+        args.fine_tune_lr = escalar_lr(args.fine_tune_lr, "fine_tune_lr")
     return args
 
 
@@ -670,6 +672,7 @@ def build_torch_loader(
     model_name: str,
     use_cuda: bool,
     shuffle: bool,
+    seed: int = 0,
 ):
     idx_files = [infer_index_file(f) for f in tfrec_files]
     cache_in_memory = os.environ.get("HCPA_CACHE_IN_MEMORY", "1").strip().lower() not in ("0", "false", "no")
@@ -683,7 +686,7 @@ def build_torch_loader(
         model_name=model_name,
         cache_in_memory=cache_in_memory,
     )
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle) if world_size > 1 else None
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, seed=seed) if world_size > 1 else None
     num_workers = min(8, os.cpu_count() or 4)
     if num_workers < 1:
         num_workers = 1
@@ -717,6 +720,7 @@ def build_csv_loader(
     model_name: str,
     use_cuda: bool,
     shuffle: bool,
+    seed: int = 0,
 ):
     dataset = RetinaCSVDataset(
         csv_path=csv_path,
@@ -728,7 +732,7 @@ def build_csv_loader(
         fundus_crop_ratio=fundus_crop_ratio,
         model_name=model_name,
     )
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle) if world_size > 1 else None
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, seed=seed) if world_size > 1 else None
     num_workers = min(8, os.cpu_count() or 4)
     if num_workers < 1:
         num_workers = 1
@@ -1185,6 +1189,7 @@ def main():
             model_name=MODEL_NAME,
             use_cuda=use_cuda,
             shuffle=True,
+            seed=args.seed,
         )
         valid_loader, valid_sampler, valid_dataset, valid_num_workers = build_csv_loader(
             args.val_csv,
@@ -1259,6 +1264,7 @@ def main():
             model_name=MODEL_NAME,
             use_cuda=use_cuda,
             shuffle=True,
+            seed=args.seed,
         )
         valid_loader, valid_sampler, valid_dataset, valid_num_workers = build_torch_loader(
             valid_files,

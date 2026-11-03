@@ -44,7 +44,7 @@ from hybrid_shared.training_utils import (
     ddp_concat_variable_length,
     ensure_cuda_ready,
 )
-from hybrid_shared.data_loader_bridge import get_data_loaders, get_backbone, unpack_batch
+from hybrid_shared.data_loader_bridge import get_data_loaders, get_backbone, set_loader_epoch, unpack_batch
 from hybrid_simple.utils import modify_backbone_for_feature_extraction
 from hybrid_shared.stability import (
     apply_finetune_lr_transition,
@@ -560,6 +560,7 @@ def main():
         world_size=world_size,
         enable_amp=args.enable_amp,
         model_name=args.backbone,
+        seed=args.seed,
     )
 
     if rank == 0:
@@ -633,6 +634,7 @@ def main():
     overall_start_time = time.perf_counter()
 
     for epoch in range(args.epochs):
+        set_loader_epoch(train_loader, epoch)
         if rank == 0:
             print(f"\n{'='*70}")
             print(f"Epoch {epoch + 1}/{args.epochs}")
