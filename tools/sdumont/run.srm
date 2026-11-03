@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=hcpa
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
+#
+# Job generico HCPA no SDumont. Uma submissao = uma celula do experimento
+# (abordagem x dataset x n_gpus x arquitetura), com os N runs em sequencia
+# dentro do mesmo job -- o SDumont limita jobs simultaneos por usuario, entao
+# empacotar runs vale muito mais do que espalhar submissoes.
+#
+# NAO edite os hiperparametros aqui: eles sao extraidos de
+# <abordagem>/run_g5k_hydra.sh, os mesmos usados no Grid'5000/GPPD. E o que
+# garante que o numero do SDumont e comparavel com o que ja foi medido.
+#
+# Variaveis (passe com sbatch --export=ALL,VAR=...):
+#   APPROACH     pytorch_base|pytorch_opt|tensorflow_base|tensorflow_opt|
+#                hybrid_simple|hybrid_token_reduction|hybrid_token_reduction_opt|
+#                retfound_green
+#   DATASET      all-tfrec-v2 (HCPA) | ddr_eyepacs (misto)
+#   NGPUS        1|2|4|6|8
+#   RUN_START/RUN_END  faixa de runs (0..9)
+#   EPOCHS       default 200
+#   BATCH_SIZE   batch POR GPU (weak scaling); vazio = default da abordagem
+#   PACK         K runs de 1 GPU EM PARALELO no mesmo no (so com NGPUS=1).
+#                O limite do SDumont e de jobs simultaneos, nao de GPUs: com
+#                PACK=4 um job de 1 no roda 4 runs ao mesmo tempo e o bloco de
+#                10 runs cai de 10 para 3 janelas. Cada run fica preso a uma GPU
+#                (CUDA_VISIBLE_DEVICES) e ao NUMA node dela (numactl), que e o
+#                que evita os workers de decode de um run invadirem os cores do
+#                outro. RESSALVA: energia por GPU segue exata (NVML e por
+#                device), mas throughput/tempo de epoca passam a conviver com
+#                contencao de CPU e de PCIe. Use PACK para os runs que existem
+#                so para a variancia de AUC, e deixe os runs de referencia de
+#                desempenho sozinhos no no (PACK vazio).
+set -euo pipefail
+
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
+APPROACH="${APPROACH:?defina APPROACH}"
+DATASET="${DATASET:-all-tfrec-v2}"
+NGPUS="${NGPUS:-1}"
+RUN_START="${RUN_START:-0}"
+RUN_END="${RUN_END:-9}"
+EPOCHS="${EPOCHS:-200}"
+BASE_SEED="${BASE_SEED:-42}"
+BATCH_SIZE="${BATCH_SIZE:-}"
+ARCH="$(uname -m)"
+SIF_DIR="${PROJECT_DIR}/containers/${ARCH}"
+CONT_WORKDIR=/workspace
+DATA_REL="data/${DATASET}"
+
+case "${APPROACH}" in
+  tensorflow_*) SIF="${SIF_DIR}/hcpa-tf.sif"; FRAMEWORK=tf ;;
+  *)            SIF="${SIF_DIR}/hcpa-pt.sif"; FRAMEWORK=pt ;;
+esac
+# As dependencias extras nao estao DENTRO da imagem: o SDumont nao mapeia
+# subuid/subgid, entao `singularity build --fakeroot` falha e o %post de um .def
+# nunca roda. A imagem e a base do NGC intacta, e o setup.sh instalou o resto num
+# diretorio do host que entra aqui por bind + PYTHONPATH.
+SITE_DIR="${SIF_DIR}/site-${FRAMEWORK}"
+LDEXTRA_DIR="${SIF_DIR}/ldextra"
+if [[ "${PRINT_ARGS_ONLY:-0}" != "1" ]]; then
+  [[ -f "${SIF}" ]] || { echo "[FAIL] container ausente: ${SIF}"
+    echo "       rode tools/sdumont/setup.sh build NESTA arquitetura (${ARCH})"; exit 91; }
+  [[ -d "${SITE_DIR}" ]] || { echo "[FAIL] dependencias ausentes: ${SITE_DIR}"
+    echo "       rode tools/sdumont/setup.sh build NESTA arquitetura (${ARCH})"; exit 91; }
+
+  # O container e o site-* vem do $SCRATCH, que e compartilhado, e a fila e
+  # homogenea (ict-gh200 = aarch64, ict-h100 = x86_64), entao o par escolhido por
+  # `uname -m` deveria sempre bater. Confere assim mesmo, porque um .sif da
+  # arquitetura errada falha com "exec format error" no meio do treino, sem dizer
+  # o motivo. Custa ~2s contra horas de fila perdidas.
+  SIF_ARCH="$(singularity exec "${SIF}" uname -m 2>/dev/null || echo desconhecida)"
+  if [[ "${SIF_ARCH}" != "${ARCH}" ]]; then
+    echo "[FAIL] container e no nao batem: no=${ARCH} ($(hostname)), container=${SIF_ARCH}"
+    echo "       ${SIF}"
+    echo "       Reconstrua NUM NO ${ARCH}: tools/sdumont/setup.sh $( [[ ${ARCH} == aarch64 ]] && echo build-offline || echo build )"
+    exit 91
+  fi
+fi
+
+NNODES="${SLURM_JOB_NUM_NODES:-1}"
+GPUS_PER_NODE=$(( NGPUS / NNODES ))
+(( GPUS_PER_NODE * NNODES == NGPUS )) || { echo "[FAIL] NGPUS=${NGPUS} nao divide por NNODES=${NNODES}"; exit 92; }
+
+GPU_MODEL="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
+TAG="${GPU_MODEL:-gpu}_${NGPUS}gpu_${DATASET}"
+RESULTS_SUBDIR="results_sdumont/${TAG}"
+
+echo "=== HCPA/SDumont ============================================="
+echo " job=${SLURM_JOB_ID:-local}  arch=${ARCH}  gpu=${GPU_MODEL}"
+echo " approach=${APPROACH}  dataset=${DATASET}  epochs=${EPOCHS}"
+echo " nodes=${NNODES} x ${GPUS_PER_NODE} gpu = ${NGPUS} gpus  runs=${RUN_START}..${RUN_END}"
+echo " sif=${SIF}"
+echo "=============================================================="
+
+# -------------------------------------------------- args da abordagem --------
+# Le TRAIN_STATIC_ARGS direto do launcher do G5K, neutralizando o executor.
+# Zero duplicacao de hiperparametro = zero risco de divergir da bateria antiga.
+# O launcher resolve TOOLS_DIR a partir de "$0", entao a extracao precisa rodar
+# com argv[0] = ./run_g5k_hydra.sh e cwd no diretorio da abordagem; e o `source`
+# de g5k_run_common.sh vira no-op porque aquele arquivo espera o estado do OAR.
+# O eco da receita vai para stderr (aparece no log do job); o stdout carrega so
+# as atribuicoes que serao avaliadas aqui.
+read_recipe() {
+  local -a vars=(TARGET_EPOCHS="${EPOCHS}" HCPA_EPOCHS="${EPOCHS}" EPOCHS="${EPOCHS}")
+  [[ -n "${BATCH_SIZE}" ]] && vars+=(BATCH_SIZE="${BATCH_SIZE}" HCPA_BATCH_SIZE="${BATCH_SIZE}")
+  env "${vars[@]}" bash "${PROJECT_DIR}/tools/sdumont/_recipe.sh" "${PROJECT_DIR}" "${APPROACH}"
+}
+eval "$(read_recipe)"
+[[ ${#TRAIN_STATIC_ARGS[@]} -gt 0 ]] || { echo "[FAIL] nao consegui ler TRAIN_STATIC_ARGS de ${APPROACH}/run_g5k_hydra.sh"; exit 93; }
+
+# Rede de seguranca: cada abordagem le epocas/batch de uma variavel diferente
+# (TARGET_EPOCHS, HCPA_EPOCHS, EPOCHS...). Em vez de confiar que a exportada
+# acima foi a certa, forca o valor final direto nos argumentos -- sem isso, um
+# smoke de 2 epocas rodaria 200 caladamente.
+override_arg() {
+  local flag="$1" value="$2" i found=0
+  [[ -n "${value}" ]] || return 0
+  for i in "${!TRAIN_STATIC_ARGS[@]}"; do
+    if [[ "${TRAIN_STATIC_ARGS[$i]}" == "${flag}" ]]; then
+      TRAIN_STATIC_ARGS[$((i+1))]="${value}"; found=1
+    fi
+  done
+  (( found )) || TRAIN_STATIC_ARGS+=("${flag}" "${value}")
+}
+override_arg --epochs "${EPOCHS}"
+# batch e POR REPLICA nos dois frameworks (PyTorch usa DistributedSampler; o TF
+# le args.batch_size como PER_REPLICA_BS), entao N GPUs = weak scaling direto.
+override_arg --batch_size "${BATCH_SIZE}"
+if [[ "${PRINT_ARGS_ONLY:-0}" == "1" ]]; then printf '%q ' "${TRAIN_STATIC_ARGS[@]}"; echo; exit 0; fi
+
+# ------------------------------------------------------ staging do dado ------
+# Lustre com 1015 shards e 200 epocas de leitura aleatoria deixa a GPU faminta.
+# Copia para o disco local do no uma vez por job. O misto tem 5.1 GB; se nao
+# couber, cai de volta para o Lustre em vez de estourar o /tmp do no.
+SRC_DATA="${PROJECT_DIR}/${DATA_REL}"
+[[ -d "${SRC_DATA}" ]] || { echo "[FAIL] dataset ausente: ${SRC_DATA}"; exit 94; }
+LOCAL_ROOT="${SLURM_TMPDIR:-/tmp}/hcpa_${SLURM_JOB_ID:-$$}"
+NEED_MB=$(( $(du -sm "${SRC_DATA}" | cut -f1) + 2048 ))
+STAGED_DIR="${SRC_DATA}"
+if srun -N"${NNODES}" --ntasks-per-node=1 bash -c "
+      set -e
+      free=\$(df -Pm '$(dirname "${LOCAL_ROOT}")' | awk 'NR==2{print \$4}')
+      [ \"\$free\" -gt ${NEED_MB} ] || { echo \"[\$(hostname)] sem espaco local (\${free}MB < ${NEED_MB}MB)\"; exit 1; }
+      mkdir -p '${LOCAL_ROOT}/${DATASET}'
+      rsync -a --size-only '${SRC_DATA}/' '${LOCAL_ROOT}/${DATASET}/'
+      echo \"[\$(hostname)] staging ok: \$(ls '${LOCAL_ROOT}/${DATASET}' | wc -l) arquivos\"
+   "; then
+  STAGED_DIR="${LOCAL_ROOT}/${DATASET}"
+else
+  echo "[WARN] staging local falhou; lendo do Lustre (esperar throughput menor)"
+fi
+
+# Pesos pre-treinados. 7 das 8 abordagens usam InceptionV3 pre-treinado (5 via
+# timm, 2 via Keras), e os nos do SDumont nao tem internet: sem este cache o job
+# morre na primeira epoca, depois de ja ter esperado na fila. Copia local porque
+# o HuggingFace precisa escrever locks no diretorio do cache.
+WEIGHTS_SRC="${PROJECT_DIR}/weights_cache"
+WEIGHTS_LOCAL="${LOCAL_ROOT}/weights"
+if [[ -d "${WEIGHTS_SRC}" ]]; then
+  srun -N"${NNODES}" --ntasks-per-node=1 bash -c \
+    "mkdir -p '${WEIGHTS_LOCAL}' && rsync -a '${WEIGHTS_SRC}/' '${WEIGHTS_LOCAL}/'" \
+    && echo "[OK] pesos pre-treinados em cache local"
+else
+  echo "[WARN] ${WEIGHTS_SRC} ausente. As abordagens com InceptionV3 vao tentar"
+  echo "       baixar da internet e falhar. Rode tools/sdumont/prepare_weights.sh"
+  echo "       no GPPD e puxe de novo com fetch.sh."
+  WEIGHTS_LOCAL=""
+fi
+
+
+# ------------------------------------------------------------- rendezvous ----
+readarray -t HOSTS < <(scontrol show hostnames "${SLURM_NODELIST:-$(hostname)}" 2>/dev/null || hostname)
+MASTER_HOST="${HOSTS[0]}"
+MASTER_ADDR="$(getent hosts "${MASTER_HOST}" | awk '{print $1; exit}')"
+MASTER_ADDR="${MASTER_ADDR:-${MASTER_HOST}}"
+
+mkdir -p "${PROJECT_DIR}/logs" "${PROJECT_DIR}/${APPROACH}/${RESULTS_SUBDIR}"
+
+# Telemetria de energia: com >1 GPU o NVML precisa somar TODAS as visiveis,
+# senao o J/img de um job de 8 GPUs sai dividido por 8.
+export HCPA_ENERGY_ALL_VISIBLE_GPUS=1
+export HCPA_CACHE_IN_MEMORY="${HCPA_CACHE_IN_MEMORY:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+
+PACK="${PACK:-}"
+if [[ -n "${PACK}" ]]; then
+  (( NGPUS == 1 && NNODES == 1 )) || { echo "[FAIL] PACK exige NGPUS=1 e 1 no (recebi ${NGPUS} gpu / ${NNODES} no)"; exit 95; }
+  echo "[PACK] ${PACK} runs de 1 GPU em paralelo neste no"
+fi
+
+# ------------------------------------------------------- corpo de um no ------
+# Escrito uma vez em disco e reaproveitado: com srun no caminho normal (1 tarefa
+# por no, DDP entre elas) e direto, em background, no caminho PACK.
+PERNODE_SH="${LOCAL_ROOT}/pernode.sh"
+mkdir -p "${LOCAL_ROOT}"
+cat > "${PERNODE_SH}" <<'PERNODE'
+set -euo pipefail
+NODE_RANK="${SLURM_NODEID:-0}"
+SLOT="${PACK_SLOT:-}"
+TMP="${LOCAL_ROOT}/r${RUN_ID}_n${NODE_RANK}"
+PERSIST="${LOCAL_ROOT}/compile_cache"   # cache do torch.compile entre runs
+mkdir -p "${TMP}/mplconfig" "${TMP}/cache" "${PERSIST}"
+
+PIN=()
+if [[ -n "${SLOT}" ]]; then
+  # Um run por GPU. numactl prende o processo INTEIRO (inclusive os workers de
+  # decode/augment) ao NUMA node daquela GPU, senao o scheduler espalha os
+  # workers de um run pelos cores do outro e o tempo de epoca vira ruido.
+  export CUDA_VISIBLE_DEVICES="${SLOT}"
+  NUMA_NODES=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)
+  if command -v numactl >/dev/null 2>&1 && (( NUMA_NODES > 1 )); then
+    N=$(( SLOT % NUMA_NODES ))
+    PIN=(numactl --cpunodebind="${N}" --membind="${N}")
+  fi
+fi
+
+if [[ "${FRAMEWORK}" == "tf" ]]; then
+  # MultiWorkerMirroredStrategy: 1 processo por NO, com MirroredStrategy interna
+  # cuidando das GPUs locais. O train.py ja detecta isso pelo TF_CONFIG.
+  if (( NNODES > 1 )); then
+    WORKERS=$(scontrol show hostnames "${SLURM_NODELIST}" | awk -v p="${MASTER_PORT}" '{printf "%s\"%s:%d\"", (NR>1?",":""), $0, p}')
+    export TF_CONFIG="{\"cluster\":{\"worker\":[${WORKERS}]},\"task\":{\"type\":\"worker\",\"index\":${NODE_RANK}}}"
+  fi
+  LAUNCH=(python3)
+elif (( NNODES > 1 )); then
+  LAUNCH=(torchrun --nnodes="${NNODES}" --nproc_per_node="${GPUS_PER_NODE}"
+          --node_rank="${NODE_RANK}" --rdzv_backend=c10d
+          --rdzv_id="${SLURM_JOB_ID:-0}${RUN_ID}" --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}")
+elif (( GPUS_PER_NODE > 1 )); then
+  LAUNCH=(torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}")
+else
+  LAUNCH=(python3)
+fi
+
+WEIGHTS_BIND=()
+if [[ -n "${WEIGHTS_LOCAL:-}" ]]; then
+  WEIGHTS_BIND=(--bind "${WEIGHTS_LOCAL}:/tmp/hcpa_weights")
+  # HF_HUB_OFFLINE evita que cada run gaste um timeout de rede antes de desistir;
+  # com o cache completo o timm resolve local, e se faltar peso o erro e imediato
+  # e legivel, em vez de um travamento de minutos por run.
+  export HF_HOME=/tmp/hcpa_weights/hf
+  export KERAS_HOME=/tmp/hcpa_weights/keras
+  export TORCH_HOME=/tmp/hcpa_weights/torch
+  export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+else
+  export HF_HOME=/tmp/hcpa/cache/hf KERAS_HOME=/tmp/hcpa/cache/keras TORCH_HOME=/tmp/hcpa/cache/torch
+fi
+
+exec "${PIN[@]}" singularity exec --nv --cleanenv \
+  --bind "${PROJECT_DIR}/${APPROACH}:${CONT_WORKDIR}" \
+  --bind "${PROJECT_DIR}/tools:${CONT_WORKDIR}/tools:ro" \
+  --bind "${PROJECT_DIR}/hybrid_shared:${CONT_WORKDIR}/hybrid_shared:ro" \
+  --bind "${STAGED_DIR}:${CONT_WORKDIR}/${DATA_REL}:ro" \
+  --bind "${TMP}:/tmp/hcpa" --bind "${PERSIST}:/tmp/hcpa_persist" \
+  --bind "${SITE_DIR}:/opt/site:ro" --bind "${LDEXTRA_DIR}:/opt/ldextra:ro" \
+  "${WEIGHTS_BIND[@]}" \
+  --pwd "${CONT_WORKDIR}" \
+  --env TMPDIR=/tmp/hcpa --env TMP=/tmp/hcpa --env TEMP=/tmp/hcpa \
+  --env MPLCONFIGDIR=/tmp/hcpa/mplconfig \
+  --env XDG_CACHE_HOME=/tmp/hcpa/cache \
+  --env HF_HOME="${HF_HOME}" --env TORCH_HOME="${TORCH_HOME}" \
+  --env KERAS_HOME="${KERAS_HOME}" --env HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-}" \
+  --env TORCHINDUCTOR_CACHE_DIR=/tmp/hcpa_persist/torchinductor \
+  --env TRITON_CACHE_DIR=/tmp/hcpa_persist/triton \
+  --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
+  --env PYTHONPATH="/opt/site" \
+  --env LD_LIBRARY_PATH="/opt/ldextra:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib64" \
+  --env KERAS_BACKEND="${KERAS_BACKEND:-}" \
+  --env TF_CONFIG="${TF_CONFIG:-}" \
+  --env TF_GPU_ALLOCATOR="${TF_GPU_ALLOCATOR:-}" \
+  --env TF_FORCE_GPU_ALLOW_GROWTH="${TF_FORCE_GPU_ALLOW_GROWTH:-}" \
+  --env TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-}" \
+  --env HCPA_ENERGY_ALL_VISIBLE_GPUS="${HCPA_ENERGY_ALL_VISIBLE_GPUS:-1}" \
+  --env HCPA_CACHE_IN_MEMORY="${HCPA_CACHE_IN_MEMORY:-1}" \
+  --env OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}" \
+  --env NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
+  --env MASTER_ADDR="${MASTER_ADDR}" --env MASTER_PORT="${MASTER_PORT}" \
+  "${SIF}" \
+  bash -c "[ -f /etc/shinit_v2 ] && . /etc/shinit_v2 >/dev/null 2>&1; exec ${LAUNCH[*]} '${CONT_WORKDIR}/${ENTRY}' ${ARGS_STR}"
+PERNODE
+
+# ------------------------------------------------------------------ runs -----
+PACK_PIDS=()
+PACK_FAILED=0
+
+for RUN_ID in $(seq "${RUN_START}" "${RUN_END}"); do
+  RUN_SEED=$(( BASE_SEED + RUN_ID ))
+  RUN_OUT="${RESULTS_SUBDIR}/run_${RUN_ID}"
+  MASTER_PORT=$(( 29500 + (${SLURM_JOB_ID:-0} % 1000) + RUN_ID ))
+  mkdir -p "${PROJECT_DIR}/${APPROACH}/${RUN_OUT}"
+
+  RUN_ARGS=( --tfrec_dir "${CONT_WORKDIR}/${DATA_REL}" )
+  [[ "${TRAIN_ACCEPTS_DATASET}" == "1" ]] && RUN_ARGS+=( --dataset "${DATASET}" )
+  RUN_ARGS+=( "${RESULTS_FLAG}" "./${RUN_OUT}" "${EXEC_FLAG}" "${RUN_ID}" )
+  [[ -n "${SEED_FLAG}" ]] && RUN_ARGS+=( "${SEED_FLAG}" "${RUN_SEED}" )
+  RUN_ARGS+=( "${TRAIN_STATIC_ARGS[@]}" )
+  ARGS_STR="$(printf '%q ' "${RUN_ARGS[@]}")"
+
+  export ARGS_STR ENTRY SIF NNODES GPUS_PER_NODE MASTER_ADDR MASTER_PORT \
+         FRAMEWORK STAGED_DIR DATA_REL CONT_WORKDIR APPROACH PROJECT_DIR \
+         RUN_ID LOCAL_ROOT SITE_DIR LDEXTRA_DIR
+
+  if [[ -n "${PACK}" ]]; then
+    export PACK_SLOT=$(( (RUN_ID - RUN_START) % PACK ))
+    echo "--- run ${RUN_ID} (seed ${RUN_SEED}) -> gpu ${PACK_SLOT}, em paralelo"
+    bash "${PERNODE_SH}" > "${PROJECT_DIR}/logs/${SLURM_JOB_NAME:-hcpa}_${SLURM_JOB_ID:-local}_run${RUN_ID}.log" 2>&1 &
+    PACK_PIDS+=("$!")
+    if (( ${#PACK_PIDS[@]} >= PACK )); then
+      for p in "${PACK_PIDS[@]}"; do wait "${p}" || PACK_FAILED=1; done
+      PACK_PIDS=()
+    fi
+  else
+    echo "--- run ${RUN_ID} (seed ${RUN_SEED}) ------------------------------"
+    srun -N"${NNODES}" --ntasks-per-node=1 --kill-on-bad-exit=1 --label bash "${PERNODE_SH}"
+    echo "--- run ${RUN_ID} concluido"
+  fi
+done
+
+for p in "${PACK_PIDS[@]:-}"; do [[ -n "${p}" ]] && { wait "${p}" || PACK_FAILED=1; }; done
+(( PACK_FAILED == 0 )) || { echo "[FAIL] algum run empacotado falhou; veja logs/"; exit 96; }
+
+rm -rf "${LOCAL_ROOT}" 2>/dev/null || true
+echo "OK. resultados em ${APPROACH}/${RESULTS_SUBDIR}"
